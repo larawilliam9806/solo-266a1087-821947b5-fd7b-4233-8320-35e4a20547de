@@ -14,7 +14,7 @@ from flask import (
     url_for,
 )
 
-from . import convert, db, domain
+from . import convert, db, domain, tickets
 from .errors import AppError, NotFound, Unprocessable
 from .publisher import Service
 from .storage import BlobStore, verify_publications
@@ -50,6 +50,9 @@ def create_app(config=None):
     try:
         db.init_db(bootstrap_conn)
         app.config["STARTUP_PROBLEMS"] = verify_publications(bootstrap_conn, store)
+        # Upgrade path: index every day's current official original once, so
+        # the investigation page works immediately on an existing install.
+        app.config["STARTUP_INDEXED"] = tickets.backfill(bootstrap_conn, store)
     finally:
         bootstrap_conn.close()
     if app.config["STARTUP_PROBLEMS"]:
@@ -266,6 +269,17 @@ def create_app(config=None):
     @app.get("/api/days")
     def api_days():
         return jsonify({"days": service.list_days()})
+
+    @app.get("/duplicates")
+    def duplicates_page():
+        ticket_id = (request.args.get("ticket_id") or "").strip() or None
+        report = service.ticket_report(ticket_id)
+        return render_template("duplicates.html", report=report)
+
+    @app.get("/api/tickets/duplicates")
+    def api_duplicate_tickets():
+        ticket_id = request.args.get("ticket_id")
+        return jsonify(service.ticket_report(ticket_id))
 
     @app.get("/api/days/<day>")
     def api_day(day):

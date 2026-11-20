@@ -21,7 +21,7 @@ import json
 import os
 import uuid
 
-from . import convert, db, domain
+from . import convert, db, domain, tickets
 from .errors import AppError, Conflict, NotFound, Unprocessable, Unavailable
 from .storage import BlobStore
 
@@ -102,6 +102,7 @@ def _preview_public_payload(preview):
             for name in domain.DOWNSTREAM_ORDER
         },
         "downstreams": result["downstreams"],
+        "tickets": result.get("tickets"),
         "created_at": preview["created_at"],
         "expires_at": preview["expires_at"],
     }
@@ -134,11 +135,14 @@ class Service:
         conn = self.conn_factory()
         try:
             # One read transaction gives a consistent snapshot of both
-            # contracts and the day pointer even if they change mid-preview.
+            # contracts, the day pointer and the ticket index even if they
+            # change mid-preview.
             conn.execute("BEGIN")
             try:
                 contracts = db.get_contracts(conn)
                 base_rev = db.day_revision(conn, day)
+                scan = tickets.scan_parsed(parsed)
+                conflicts = tickets.find_conflicts(conn, day, scan)
             finally:
                 conn.execute("COMMIT")
             db.purge_expired_previews(conn)
@@ -149,6 +153,9 @@ class Service:
                 results[name] = outcome
                 if outcome["status"] != "ok":
                     convertible = False
+            ticket_snapshot = tickets.preview_snapshot(scan, conflicts)
+            if ticket_snapshot["status"] != "ok":
+                convertible = False
             original_name = _safe_name(filename)
             original_sha = self.store.put_bytes(raw_bytes)
             for name in domain.DOWNSTREAM_ORDER:
@@ -175,6 +182,7 @@ class Service:
                     for name in domain.DOWNSTREAM_ORDER
                 },
                 "downstreams": results,
+                "tickets": ticket_snapshot,
                 "convertible": convertible,
             }
             preview_id = uuid.uuid4().hex
@@ -260,6 +268,29 @@ class Service:
                         )
 
                 if not preview["convertible"] or not result.get("convertible"):
+                    # Surface the most specific ticket problem rather than a
+                    # generic "incompatible", so the operator knows what to fix.
+                    snapshot = result.get("tickets") or {}
+                    if snapshot.get("status") != "ok":
+                        if not snapshot.get("has_ticket_id", True):
+                            raise Unprocessable(
+                                "原件缺少 ticket_id 列，不能发布；请补齐该列后重新预览",
+                                code="missing_ticket_id",
+                            )
+                        if snapshot.get("blank_row_count"):
+                            raise Unprocessable(
+                                f"有 {snapshot['blank_row_count']} 行的票号为空；"
+                                "每行都必须填写票号，请修正后重新预览",
+                                code="blank_ticket_ids",
+                                details={"blank_rows": snapshot.get("blank_rows", [])},
+                            )
+                        if snapshot.get("cross_day_conflict_count"):
+                            raise Unprocessable(
+                                "新增票号会在各日当前正式原件中重复，已拒绝整批；"
+                                "请先排查重票",
+                                code="duplicate_ticket",
+                                details={"conflicts": snapshot.get("cross_day_conflicts", [])},
+                            )
                     raise Unprocessable(
                         "存在不兼容的列或行，不能发布；请修正 CSV 或契约后重新预览",
                         code="incompatible",
@@ -293,7 +324,40 @@ class Service:
                     if not self.store.exists(actual):
                         self.store.put_bytes(outcome["output_bytes"])
 
-                # Blobs are durable; now commit the row + pointer atomically.
+                # Ticket-id gate.  Both rules are re-evaluated from the
+                # original bytes inside the write lock; the duplicate totals
+                # come only from the index, never from other days' files.
+                scan = tickets.scan_parsed(parsed)
+                if not scan.has_ticket_id:
+                    raise Unprocessable(
+                        "原件缺少 ticket_id 列，不能发布；请补齐该列后重新预览",
+                        code="missing_ticket_id",
+                    )
+                if scan.blanks:
+                    sample = ", ".join(str(line) for _row, line in scan.blanks[:10])
+                    raise Unprocessable(
+                        f"有 {len(scan.blanks)} 行的票号为空（文件行号 {sample}），"
+                        "每行都必须填写票号；请修正后重新预览",
+                        code="blank_ticket_ids",
+                        details={"blank_rows": [
+                            {"row": row_no, "line": line_no}
+                            for row_no, line_no in scan.blanks[:200]
+                        ]},
+                    )
+                conflicts = tickets.find_conflicts(conn, day, scan)
+                if conflicts:
+                    ticket_list = ", ".join(item["ticket_id"] for item in conflicts[:20])
+                    more = " 等" if len(conflicts) > 20 else ""
+                    raise Unprocessable(
+                        f"发布后票号 {ticket_list}{more} 会在各日当前正式原件中出现多于一次，"
+                        "已拒绝整批；请先排查重票",
+                        code="duplicate_ticket",
+                        details={"conflicts": conflicts},
+                    )
+
+                # Blobs are durable; now commit the row + pointer + index
+                # atomically so the new revision and its ticket index flip
+                # together.
                 new_rev = current_rev + 1
                 created_at = db.iso(db.utcnow())
                 settlement_cols = json.dumps(result["contracts"]["settlement"]["columns"], ensure_ascii=False)
@@ -340,6 +404,16 @@ class Service:
                     "UPDATE previews SET consumed_at = ? WHERE id = ?",
                     (created_at, preview_id),
                 )
+                # The index now describes the new current revision; it is
+                # written in this transaction so readers see both or neither.
+                tickets.replace_day_index(
+                    conn,
+                    day=day,
+                    rev=new_rev,
+                    original_sha256=preview["original_sha256"],
+                    scan=scan,
+                    indexed_at=created_at,
+                )
                 # The preview row is now consumed; publications are the only
                 # thing downloads resolve against, so the preview can go.
                 db.delete_preview(conn, preview_id)
@@ -370,6 +444,96 @@ class Service:
             }
         finally:
             conn.close()
+
+    # ------------------------------------------------------------------
+    # ticket investigation
+    # ------------------------------------------------------------------
+    def ticket_report(self, ticket_id=None):
+        """Duplicate report built solely from the ticket index.
+
+        No original is read here; the result reflects exactly the current
+        official revision of every day.
+        """
+        conn = self.conn_factory()
+        try:
+            indexes = db.list_day_ticket_index(conn)
+            if ticket_id is not None:
+                ticket_id = ticket_id.strip()
+                if not ticket_id:
+                    raise AppError("票号不能为空", code="invalid_ticket_id")
+                occurrences = db.occurrences_for_ticket(conn, ticket_id)
+                groups = []
+                if occurrences:
+                    groups.append(
+                        {
+                            "ticket_id": ticket_id,
+                            "total": len(occurrences),
+                            "occurrences": [
+                                {
+                                    "day": item["day"],
+                                    "rev": item["rev"],
+                                    "line_no": item["line_no"],
+                                }
+                                for item in occurrences
+                            ],
+                        }
+                    )
+            else:
+                groups = []
+                for row in db.duplicate_tickets(conn):
+                    occurrences = db.occurrences_for_ticket(conn, row["ticket_id"])
+                    groups.append(
+                        {
+                            "ticket_id": row["ticket_id"],
+                            "total": int(row["total"]),
+                            "occurrences": [
+                                {
+                                    "day": item["day"],
+                                    "rev": item["rev"],
+                                    "line_no": item["line_no"],
+                                }
+                                for item in occurrences
+                            ],
+                        }
+                    )
+            indexed_at = max(
+                (row["indexed_at"] for row in indexes), default=None
+            )
+            return {
+                "ticket_id": ticket_id,
+                "duplicate_count": len(groups),
+                "duplicates": groups,
+                "days": [
+                    dict(
+                        self._index_payload(row),
+                        blank_lines=db.list_day_blanks(conn, row["day"])
+                        if row["blank_count"]
+                        else [],
+                    )
+                    for row in indexes
+                ],
+                "problems": [
+                    self._index_payload(row)
+                    for row in indexes
+                    if row["state"] != tickets.STATE_READY
+                ],
+                "indexed_at": indexed_at,
+            }
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _index_payload(row):
+        return {
+            "day": row["day"],
+            "rev": row["rev"],
+            "state": row["state"],
+            "detail": row["detail"],
+            "has_ticket_id": bool(row["has_ticket_id"]),
+            "ticket_count": row["ticket_count"],
+            "blank_count": row["blank_count"],
+            "indexed_at": row["indexed_at"],
+        }
 
     def resolve_download(self, day, rev, kind):
         day = _check_day(day)

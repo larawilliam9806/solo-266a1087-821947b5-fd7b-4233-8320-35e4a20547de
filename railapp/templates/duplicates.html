@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block title %}重票排查 · 日结发布台{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>重票排查</h1>
+  <p class="muted">
+    按各日<strong>当前正式原件</strong>的 <code>ticket_id</code> 查重。结果直接读索引，
+    不会重新读取任何日期的原件文件。
+    {% if report.indexed_at %}
+    索引最近建/补建于 <span class="mono">{{ report.indexed_at }}</span>；新发布会在同一事务内更新索引。
+    {% endif %}
+  </p>
+
+  <form method="get" action="{{ url_for('duplicates_page') }}" class="upload-form">
+    <div class="field">
+      <label for="ticket_id">按票号查询</label>
+      <input type="text" id="ticket_id" name="ticket_id" value="{{ report.ticket_id or '' }}"
+             placeholder="留空则列出所有重票">
+    </div>
+    <div class="form-actions">
+      <button type="submit" class="button">查询</button>
+      {% if report.ticket_id %}<a class="button ghost" href="{{ url_for('duplicates_page') }}">查看全部</a>{% endif %}
+    </div>
+  </form>
+
+  {% if report.problems %}
+  <div class="alert warn">
+    <strong>索引不完整或不可用的日期：</strong>
+    <ul>
+      {% for item in report.problems %}
+      <li>
+        {{ item.day }}（r{{ item.rev }}）：
+        {% if item.state == 'missing_ticket_id' %}当前正式原件缺少 <code>ticket_id</code> 列，未参与查重
+        {% elif item.state == 'blank_tickets' %}有 {{ item.blank_count }} 行票号为空，已标出
+        {% elif item.state == 'unavailable' %}无法建立索引：{{ item.detail or '原件不可读' }}
+        {% else %}{{ item.state }}{% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+  {% if report.ticket_id %}
+  <h2>票号 <code>{{ report.ticket_id }}</code></h2>
+  {% if report.duplicates and report.duplicates[0].occurrences %}
+  <p class="muted">该票号在各日当前正式原件中共出现 {{ report.duplicates[0].total }} 次。</p>
+  {% else %}
+  <p class="empty">索引中没有该票号。</p>
+  {% endif %}
+  {% else %}
+  {% if report.duplicates %}
+  <p class="muted">共发现 <strong>{{ report.duplicate_count }}</strong> 个重票号。</p>
+  {% else %}
+  <p class="empty">没有发现重票。</p>
+  {% endif %}
+  {% endif %}
+
+  {% for group in report.duplicates %}
+  <section class="panel duplicate-card">
+    <h2>
+      票号 <code>{{ group.ticket_id }}</code>
+      <span class="tag">{{ group.total }} 次</span>
+    </h2>
+    <table class="grid compact">
+      <thead><tr><th>日期</th><th>修订号</th><th>原件行号</th></tr></thead>
+      <tbody>
+      {% for occ in group.occurrences %}
+        <tr>
+          <td><a href="{{ url_for('day_page', day=occ.day) }}">{{ occ.day }}</a></td>
+          <td>r{{ occ.rev }}</td>
+          <td class="mono">{{ occ.line_no }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% endfor %}
+</section>
+
+<section class="panel">
+  <h2>各日索引状态</h2>
+  <p class="muted">索引描述每日当前正式原件；缺票号列与空票号行在此标出。</p>
+  {% if report.days %}
+  <table class="grid compact">
+    <thead><tr><th>日期</th><th>修订号</th><th>票号列</th><th>已索引票号行</th><th>空票号行</th><th>状态</th><th>索引时间</th></tr></thead>
+    <tbody>
+    {% for item in report.days %}
+      <tr>
+        <td><a href="{{ url_for('day_page', day=item.day) }}">{{ item.day }}</a></td>
+        <td>r{{ item.rev }}</td>
+        <td>{% if item.has_ticket_id %}<span class="tag ok">有</span>{% else %}<span class="tag bad">缺少</span>{% endif %}</td>
+        <td>{{ item.ticket_count }}</td>
+        <td>{% if item.blank_count %}<span class="tag bad">{{ item.blank_count }}</span>{% else %}0{% endif %}</td>
+        <td>
+          {% if item.state == 'ready' %}正常
+          {% elif item.state == 'blank_tickets' %}空票号
+          {% elif item.state == 'missing_ticket_id' %}缺票号列
+          {% elif item.state == 'unavailable' %}不可用：{{ item.detail or '原件不可读' }}
+          {% else %}{{ item.state }}{% endif %}
+        </td>
+        <td class="muted mono">{{ item.indexed_at }}</td>
+      </tr>
+      {% if item.blank_lines %}
+      <tr>
+        <td colspan="7" class="muted">
+          {{ item.day }} 的空票号原件行号：
+          <span class="mono">{{ item.blank_lines|join('、') }}</span>
+        </td>
+      </tr>
+      {% endif %}
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">还没有任何已发布的日期可供建立索引。</p>
+  {% endif %}
+</section>
+{% endblock %}

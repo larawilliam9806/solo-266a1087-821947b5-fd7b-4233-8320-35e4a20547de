@@ -9,6 +9,7 @@
   const root = document.getElementById("preview-root");
   const summary = document.getElementById("preview-summary");
   const stack = document.getElementById("preview-downstreams");
+  const ticketCheck = document.getElementById("ticket-check");
   const confirmButton = document.getElementById("confirm-button");
   const discardButton = document.getElementById("discard-button");
   const tpl = document.getElementById("downstream-template");
@@ -141,6 +142,48 @@
     return node;
   }
 
+  function renderTickets(tickets) {
+    if (!tickets) {
+      ticketCheck.hidden = true;
+      return;
+    }
+    ticketCheck.replaceChildren();
+    ticketCheck.hidden = false;
+    const ok = tickets.status === "ok";
+    ticketCheck.className = "alert " + (ok ? "ok" : "danger");
+    const title = el("strong", "", ok ? "票号检查通过。" : "票号检查未通过：");
+    ticketCheck.appendChild(title);
+    const parts = [];
+    if (!tickets.has_ticket_id) {
+      parts.push("原件缺少 ticket_id 列，不能发布。");
+    }
+    if (tickets.blank_row_count) {
+      const lines = (tickets.blank_rows || []).map((r) => r.line).slice(0, 20);
+      parts.push(`有 ${tickets.blank_row_count} 行票号为空（文件行号 ${lines.join("、")}），每行票号都必须填写。`);
+    }
+    if (tickets.in_day_duplicate_count) {
+      const sample = tickets.in_day_duplicates
+        .slice(0, 5)
+        .map((d) => `${d.ticket_id}×${d.count}`)
+        .join("、");
+      parts.push(`本日内部有 ${tickets.in_day_duplicate_count} 个票号重复（${sample}）。`);
+    }
+    if (tickets.cross_day_conflict_count) {
+      const sample = tickets.cross_day_conflicts
+        .slice(0, 5)
+        .map((d) => `${d.ticket_id}（合计 ${d.total_after} 次）`)
+        .join("、");
+      parts.push(`以下票号在发布后会在各日当前正式原件中合计出现多于一次，整批不可发布：${sample}。`);
+    }
+    const text = el("span", "", " " + (parts.length ? parts.join(" ") : "原件已含 ticket_id 列，各行票号均已填写，且未发现新增重票。"));
+    ticketCheck.appendChild(text);
+    if (!ok) {
+      const link = el("a", "", " 打开重票排查页");
+      link.href = "/duplicates";
+      ticketCheck.appendChild(link);
+    }
+  }
+
   function renderPreview(preview) {
     currentPreview = preview;
     stack.replaceChildren();
@@ -158,6 +201,8 @@
     card("数据行数", preview.original.row_count);
     card("整体结果", preview.convertible ? "可发布" : "不可发布",
       preview.convertible ? "ok" : "bad");
+
+    renderTickets(preview.tickets);
 
     ["settlement", "ridership"].forEach((name) => {
       stack.appendChild(renderDownstream(name, preview.downstreams[name]));

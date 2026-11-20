@@ -271,7 +271,10 @@ def test_original_bytes_are_preserved_exactly(client):
 
 def test_other_day_is_independent(client):
     preview_and_confirm(client, day="2026-11-01")
-    preview_and_confirm(client, day="2026-11-02", data=DEFAULT_CSV.encode())
+    # Different ticket ids: the same ticket on two days is now a cross-day
+    # duplicate and would be rejected on purpose.
+    other_day = DEFAULT_CSV.replace("T1,", "D1,").replace("T2,", "D2,").replace("T3,", "D3,")
+    preview_and_confirm(client, day="2026-11-02", data=other_day.encode())
     assert client.get("/api/days/2026-11-01").get_json()["current_rev"] == 1
     assert client.get("/api/days/2026-11-02").get_json()["current_rev"] == 1
     days = client.get("/api/days").get_json()["days"]

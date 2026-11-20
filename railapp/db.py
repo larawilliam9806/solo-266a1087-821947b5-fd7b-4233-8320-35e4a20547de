@@ -60,8 +60,44 @@ CREATE TABLE IF NOT EXISTS previews (
     consumed_at            TEXT
 );
 
+-- One row per day, describing the ticket_id index of that day's *current*
+-- official original.  It is replaced in the same transaction as a new
+-- publication, so the index and the revision always become visible together.
+CREATE TABLE IF NOT EXISTS day_ticket_index (
+    day             TEXT PRIMARY KEY,
+    rev             INTEGER NOT NULL,
+    original_sha256 TEXT NOT NULL,
+    has_ticket_id   INTEGER NOT NULL,
+    ticket_count    INTEGER NOT NULL,
+    blank_count     INTEGER NOT NULL,
+    state           TEXT NOT NULL,
+    detail          TEXT,
+    indexed_at      TEXT NOT NULL
+);
+
+-- Every non-blank ticket occurrence in a day's current original.  ``line_no``
+-- is the physical line number in the original CSV (header is line 1).
+CREATE TABLE IF NOT EXISTS ticket_occurrences (
+    day       TEXT NOT NULL,
+    rev       INTEGER NOT NULL,
+    ticket_id TEXT NOT NULL,
+    line_no   INTEGER NOT NULL
+);
+
+-- Physical line numbers of rows whose ticket_id is blank (legacy originals).
+CREATE TABLE IF NOT EXISTS ticket_blanks (
+    day     TEXT NOT NULL,
+    rev     INTEGER NOT NULL,
+    line_no INTEGER NOT NULL,
+    PRIMARY KEY (day, rev, line_no)
+);
+
 CREATE INDEX IF NOT EXISTS idx_publications_day ON publications(day, rev);
 CREATE INDEX IF NOT EXISTS idx_previews_expiry ON previews(expires_at);
+CREATE INDEX IF NOT EXISTS idx_ticket_occurrences_ticket
+    ON ticket_occurrences(ticket_id, day);
+CREATE INDEX IF NOT EXISTS idx_ticket_occurrences_day
+    ON ticket_occurrences(day);
 """
 
 PREVIEW_TTL_SECONDS = 2 * 60 * 60
@@ -179,6 +215,127 @@ def list_days(conn, limit=200):
                   (SELECT count(*) FROM publications p WHERE p.day = d.day) AS revision_count
            FROM days d ORDER BY d.day DESC LIMIT ?""",
         (limit,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_day_ticket_index(conn, day):
+    row = conn.execute(
+        "SELECT * FROM day_ticket_index WHERE day = ?", (day,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def list_day_ticket_index(conn):
+    rows = conn.execute(
+        "SELECT * FROM day_ticket_index ORDER BY day"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def replace_day_ticket_index(conn, *, day, rev, original_sha256, has_ticket_id,
+                             ticket_count, blank_count, state, detail,
+                             indexed_at, occurrences=None, blanks=None):
+    """Atomically replace one day's ticket index.
+
+    Caller supplies the enclosing transaction: the index must flip together
+    with the publication it describes.
+    """
+    conn.execute("DELETE FROM ticket_occurrences WHERE day = ?", (day,))
+    conn.execute("DELETE FROM ticket_blanks WHERE day = ?", (day,))
+    conn.execute(
+        """INSERT INTO day_ticket_index
+           (day, rev, original_sha256, has_ticket_id, ticket_count, blank_count,
+            state, detail, indexed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(day) DO UPDATE SET
+             rev = excluded.rev,
+             original_sha256 = excluded.original_sha256,
+             has_ticket_id = excluded.has_ticket_id,
+             ticket_count = excluded.ticket_count,
+             blank_count = excluded.blank_count,
+             state = excluded.state,
+             detail = excluded.detail,
+             indexed_at = excluded.indexed_at""",
+        (day, rev, original_sha256, has_ticket_id, ticket_count, blank_count,
+         state, detail, indexed_at),
+    )
+    if occurrences:
+        conn.executemany(
+            "INSERT INTO ticket_occurrences (day, rev, ticket_id, line_no) VALUES (?, ?, ?, ?)",
+            [(day, rev, ticket, line) for ticket, line in occurrences],
+        )
+    if blanks:
+        conn.executemany(
+            "INSERT INTO ticket_blanks (day, rev, line_no) VALUES (?, ?, ?)",
+            [(day, rev, line) for _row, line in blanks],
+        )
+
+
+def day_ticket_counts(conn, day):
+    """Occurrence counts of the day's current index, keyed by ticket id."""
+    rows = conn.execute(
+        "SELECT ticket_id, count(*) AS n FROM ticket_occurrences "
+        "WHERE day = ? GROUP BY ticket_id",
+        (day,),
+    ).fetchall()
+    return {r["ticket_id"]: int(r["n"]) for r in rows}
+
+
+def global_ticket_counts(conn, tickets):
+    """Totals across all days' current indexes for the given ticket ids.
+
+    Queried in chunks so a large batch never exceeds SQLite's bound-variable
+    limit.
+    """
+    tickets = list(tickets)
+    totals = {}
+    chunk_size = 400
+    for start in range(0, len(tickets), chunk_size):
+        chunk = tickets[start:start + chunk_size]
+        marks = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"""SELECT ticket_id, count(*) AS n FROM ticket_occurrences
+                WHERE ticket_id IN ({marks}) GROUP BY ticket_id""",
+            chunk,
+        ).fetchall()
+        totals.update({r["ticket_id"]: int(r["n"]) for r in rows})
+    return totals
+
+
+def occurrences_for_ticket(conn, ticket_id):
+    rows = conn.execute(
+        """SELECT day, rev, line_no FROM ticket_occurrences
+           WHERE ticket_id = ? ORDER BY day, line_no""",
+        (ticket_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_day_occurrences(conn, day):
+    rows = conn.execute(
+        """SELECT ticket_id, line_no FROM ticket_occurrences
+           WHERE day = ? ORDER BY line_no""",
+        (day,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_day_blanks(conn, day):
+    rows = conn.execute(
+        "SELECT line_no FROM ticket_blanks WHERE day = ? ORDER BY line_no", (day,)
+    ).fetchall()
+    return [int(r["line_no"]) for r in rows]
+
+
+def duplicate_tickets(conn):
+    """Tickets occurring more than once across all days' current indexes."""
+    rows = conn.execute(
+        """SELECT ticket_id, count(*) AS total, count(DISTINCT day) AS day_count
+           FROM ticket_occurrences
+           GROUP BY ticket_id
+           HAVING count(*) > 1
+           ORDER BY total DESC, ticket_id"""
     ).fetchall()
     return [dict(r) for r in rows]
 
